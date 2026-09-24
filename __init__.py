@@ -1,4 +1,4 @@
-"""Pomodoro and review-count bars for Anki's reviewer."""
+"""Pomodoro Bar timer and review bars for Anki's reviewer."""
 
 from __future__ import annotations
 
@@ -292,7 +292,7 @@ def _ensure_ticker() -> None:
 class SettingsDialog(QDialog):
     def __init__(self) -> None:
         super().__init__(mw)
-        self.setWindowTitle("Pomodoro Review Bars")
+        self.setWindowTitle("Pomodoro Bar")
         outer = QVBoxLayout(self)
         form = QFormLayout()
 
@@ -437,9 +437,9 @@ def _toolbar_links(links: list[str], toolbar) -> None:
         links.append(
             toolbar.create_link(
                 "pomodoro-settings",
-                "Pomodoro",
+                "Pomodoro Bar",
                 _show_settings,
-                tip="Pomodoro timer and review bar settings",
+                tip="Pomodoro Bar settings and controls",
             )
         )
 
@@ -448,7 +448,7 @@ def _install_tools_action() -> None:
     global _tools_action
     if _tools_action is not None or getattr(mw, "form", None) is None:
         return
-    _tools_action = QAction("Pomodoro", mw)
+    _tools_action = QAction("Pomodoro Bar", mw)
     _tools_action.triggered.connect(_show_settings)
     mw.form.menuTools.addAction(_tools_action)
     _tools_action.setVisible(_config.get("settings_location", "toolbar") == "tools")
