@@ -1,7 +1,7 @@
 # Pomodoro Bar
 
 Pomodoro Bar is an Anki add-on for timing study sessions and tracking review
-answers as you work through cards.
+answers as you work through cards. This add on was vibe coded with GPT-6 Luna
 
 ## Features
 
