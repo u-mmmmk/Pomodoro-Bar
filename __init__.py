@@ -11,6 +11,7 @@ from aqt.qt import (
     QAction,
     QColor,
     QColorDialog,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -24,12 +25,13 @@ from aqt.qt import (
 
 
 DEFAULTS = {
-    "pomodoro_minutes": 25,
+    "pomodoro_minutes": 20,
     "reviews_per_full_bar": 100,
-    "timer_color": "#e76f51",
+    "timer_color": "#1e88e5",
     "height_px": 3,
     "settings_location": "toolbar",
     "review_menu_position": "none",
+    "show_home_sessions": True,
 }
 
 # These match the familiar Again / Hard / Good / Easy feedback colors.
@@ -42,6 +44,7 @@ REVIEW_COLORS = {
 CONTROL_PLAYING_COLOR = "#2e7d32"
 CONTROL_RESET_COLOR = "#444"
 CONTROL_PAUSED_COLOR = CONTROL_RESET_COLOR
+CONTROL_COMPLETE_COLOR = "#fb8c00"
 
 _saved_config = mw.addonManager.getConfig(__name__) or {}
 _config = {**DEFAULTS, **_saved_config}
@@ -64,6 +67,7 @@ _elapsed_before_start = 0.0
 _review_ratings: list[str] = []
 _running = False
 _session_active = False
+_completed = False
 _resume_when_review_returns = False
 _tools_action: QAction | None = None
 
@@ -91,7 +95,7 @@ def _menu_html() -> str:
     position = str(_config.get("review_menu_position", "none"))
     toggle_icon = "⏸" if _running else "▶"
     toggle_label = "Pause timer" if _running else "Start timer"
-    toggle_color = CONTROL_PLAYING_COLOR if _running else CONTROL_PAUSED_COLOR
+    toggle_color = _control_color()
     return f"""
 <div id="pomodoro-control-menu" style="position:fixed; z-index:2147483647; { _position_style(position) } display:flex; align-items:flex-start; gap:4px; pointer-events:auto;">
   <button type="button" data-pb-toggle title="{toggle_label}" aria-label="{toggle_label}"
@@ -108,16 +112,44 @@ def _bar_html() -> str:
     return f"""
 <div id="pomodoro-review-bars" aria-hidden="true">
   <div class="pb-track"><div id="pb-timer" class="pb-fill"></div></div>
-  <div class="pb-track"><div id="pb-reviews" class="pb-fill pb-review-fill"></div></div>
+  <div class="pb-track"><div id="pb-reviews" class="pb-fill"></div></div>
 </div>
 <style>
-  #pomodoro-review-bars {{ position:fixed; z-index:2147483646; left:0; right:0; bottom:0; display:{'block' if _session_active else 'none'}; pointer-events:none; }}
+  /* Keep card content stable where supported; the bars are sized separately. */
+  html {{ scrollbar-gutter:stable; }}
+  #pomodoro-review-bars {{ position:fixed; z-index:2147483646; left:0; width:0; bottom:0; display:{'block' if _session_active else 'none'}; pointer-events:none; }}
   #pomodoro-review-bars .pb-track {{ width:100%; height:{height}px; background:transparent; overflow:hidden; }}
   #pomodoro-review-bars .pb-fill {{ width:0; height:100%; transition:width 250ms linear; }}
   #pb-timer {{ background:{_timer_color()}; }}
   #pb-reviews {{ display:flex; transition:none !important; }}
   #pb-reviews > span {{ flex:1 1 0; min-width:0; height:100%; }}
 </style>
+<script>
+(() => {{
+  const bars = document.getElementById('pomodoro-review-bars');
+  if (!bars) return;
+
+  // Measure a scrollbar even on a short card. This hidden, fixed-size probe
+  // does not change the page's scrolling or depend on scrollbar-gutter support.
+  const probe = document.createElement('div');
+  probe.style.cssText = 'position:fixed; left:0; top:0; width:100px; height:100px; box-sizing:content-box; margin:0; padding:0; border:0; overflow:scroll; visibility:hidden; pointer-events:none;';
+  document.body.appendChild(probe);
+  const scrollbarWidth = Math.max(0, probe.offsetWidth - probe.clientWidth);
+  probe.remove();
+
+  let previousViewportWidth = null;
+  function updateWidth() {{
+    // innerWidth includes the scrollbar, unlike the page's content width.
+    // Ignore scrollbar-only resize events so front/back flips keep one width.
+    const viewportWidth = window.innerWidth;
+    if (viewportWidth === previousViewportWidth) return;
+    previousViewportWidth = viewportWidth;
+    bars.style.width = Math.max(0, viewportWidth - scrollbarWidth) + 'px';
+  }}
+  updateWidth();
+  window.addEventListener('resize', updateWidth);
+}})();
+</script>
 """
 
 
@@ -137,6 +169,68 @@ def _elapsed() -> float:
     return _elapsed_before_start
 
 
+def _duration_seconds() -> int:
+    return max(1, int(_config.get("pomodoro_minutes", DEFAULTS["pomodoro_minutes"]))) * 60
+
+
+def _deck_browser_due_total(deck_browser: Any) -> int:
+    """Return today's available New, Learn, and Review cards across all decks."""
+    # Anki 23.10 stores the tree on _dueTree; newer releases expose it through
+    # render data. Top-level counts already include their children, so summing
+    # only those nodes avoids counting parent/child rows twice.
+    tree = getattr(deck_browser, "_dueTree", None)
+    if tree is None:
+        render_data = getattr(deck_browser, "_render_data", None)
+        tree = getattr(render_data, "tree", None)
+    if tree is None:
+        return 0
+
+    return sum(
+        int(node.new_count) + int(node.learn_count) + int(node.review_count)
+        for node in tree.children
+    )
+
+
+def _remaining_sessions(cards_remaining: int) -> int:
+    goal = _review_goal()
+    return (cards_remaining + goal - 1) // goal
+
+
+def _remaining_sessions_text(cards_remaining: int) -> str:
+    sessions = _remaining_sessions(cards_remaining)
+    return f"{cards_remaining} Cards Remaining - {sessions} Pomodoro Sessions"
+
+
+def _append_home_sessions(deck_browser: Any, content: Any) -> None:
+    if not _config.get("show_home_sessions", DEFAULTS["show_home_sessions"]):
+        return
+    cards_remaining = _deck_browser_due_total(deck_browser)
+    summary = (
+        '<div id="pomodoro-home-sessions" style="margin-bottom:8px;">'
+        f"{_remaining_sessions_text(cards_remaining)}"
+        "</div>"
+    )
+    content.stats = summary + content.stats
+
+
+def _append_overview_sessions(overview: Any, content: Any) -> None:
+    if not _config.get("show_home_sessions", DEFAULTS["show_home_sessions"]):
+        return
+    # Use the same selected-deck New / Learn / Review counts as Study Now.
+    cards_remaining = sum(overview.mw.col.sched.counts())
+    content.table += (
+        '<div id="pomodoro-overview-sessions" style="margin-top:12px; text-align:center;">'
+        f"{_remaining_sessions_text(cards_remaining)}"
+        "</div>"
+    )
+
+
+def _control_color() -> str:
+    if _completed:
+        return CONTROL_COMPLETE_COLOR
+    return CONTROL_PLAYING_COLOR if _running else CONTROL_PAUSED_COLOR
+
+
 def _review_web() -> QWidget | None:
     reviewer = getattr(mw, "reviewer", None)
     return getattr(reviewer, "web", None)
@@ -147,7 +241,7 @@ def _update_bars() -> None:
     if web is None:
         return
 
-    duration = max(1, int(_config.get("pomodoro_minutes", DEFAULTS["pomodoro_minutes"]))) * 60
+    duration = _duration_seconds()
     goal = _review_goal()
     timer_pct = min(100, _elapsed() / duration * 100)
     review_pct = min(100, len(_review_ratings) / goal * 100)
@@ -182,6 +276,7 @@ def _refresh_menu_state(web: QWidget | None) -> None:
     if web is None:
         return
     running = json.dumps(_running)
+    color = json.dumps(_control_color())
     web.eval(f"""(() => {{
       const menu = document.getElementById('pomodoro-control-menu');
       if (!menu) return;
@@ -189,7 +284,7 @@ def _refresh_menu_state(web: QWidget | None) -> None:
       if (toggle) {{
         toggle.textContent = {running} ? '⏸' : '▶';
         toggle.title = {running} ? 'Pause timer' : 'Start timer';
-        toggle.style.backgroundColor = {json.dumps(CONTROL_PLAYING_COLOR if _running else CONTROL_PAUSED_COLOR)};
+        toggle.style.backgroundColor = {color};
         toggle.setAttribute('aria-label', toggle.title);
       }}
     }})();""")
@@ -219,8 +314,13 @@ def _sync_open_menu() -> None:
 
 
 def _set_timer_running(running: bool) -> None:
-    global _elapsed_before_start, _timer_started, _running, _session_active
+    global _elapsed_before_start, _timer_started, _running, _session_active, _completed
     if running:
+        if _completed:
+            _elapsed_before_start = 0.0
+            _timer_started = None
+            _review_ratings.clear()
+            _completed = False
         _session_active = True
     if running and not _running:
         _timer_started = time.monotonic()
@@ -242,10 +342,11 @@ def _toggle_timer() -> None:
 
 
 def _reset_timer() -> None:
-    global _elapsed_before_start, _timer_started, _session_active, _resume_when_review_returns
+    global _elapsed_before_start, _timer_started, _session_active, _resume_when_review_returns, _completed
     _elapsed_before_start = 0.0
     _timer_started = time.monotonic() if _running else None
     _session_active = _running
+    _completed = False
     _resume_when_review_returns = False
     _review_ratings.clear()
     _update_bars()
@@ -271,7 +372,6 @@ def _on_answer(reviewer, card, ease: int) -> None:
     if _session_active:
         _review_ratings.append(_answer_rating(reviewer, card, ease))
     _update_bars()
-    _refresh_menu_state(_review_web())
 
 
 def _ensure_ticker() -> None:
@@ -280,13 +380,35 @@ def _ensure_ticker() -> None:
 
         ticker = QTimer(mw)
         ticker.setInterval(1000)
-        ticker.timeout.connect(_update_bars)
+        ticker.timeout.connect(_on_tick)
         mw._pomodoro_bar_ticker = ticker
     ticker = mw._pomodoro_bar_ticker
     if _running:
         ticker.start()
     else:
         ticker.stop()
+
+
+def _show_completion_notice() -> None:
+    from aqt.utils import tooltip
+
+    tooltip("Pomodoro complete!", period=3000)
+
+
+def _on_tick() -> None:
+    global _completed
+    if _running and _elapsed() >= _duration_seconds():
+        _set_timer_running(False)
+        _completed = True
+        _refresh_menu_state(_review_web())
+        _refresh_open_settings_dialogs()
+        _show_completion_notice()
+    _update_bars()
+
+
+def _refresh_open_settings_dialogs() -> None:
+    for dialog in mw.findChildren(SettingsDialog):
+        dialog._refresh_status()
 
 
 class SettingsDialog(QDialog):
@@ -305,6 +427,10 @@ class SettingsDialog(QDialog):
         self.height = QSpinBox()
         self.height.setRange(1, 12)
         self.height.setValue(int(_config["height_px"]))
+        self.show_home_sessions = QCheckBox(
+            "Show number of Pomodoro sessions to complete cards"
+        )
+        self.show_home_sessions.setChecked(bool(_config["show_home_sessions"]))
 
         self.timer_color = _timer_color()
         self.color_button = QPushButton()
@@ -333,6 +459,7 @@ class SettingsDialog(QDialog):
         form.addRow("Timer bar color", self.color_button)
         form.addRow("Settings entry location", self.settings_location)
         form.addRow("Timer controls location", self.menu_position)
+        form.addRow(self.show_home_sessions)
         outer.addLayout(form)
 
         controls = QHBoxLayout()
@@ -377,7 +504,7 @@ class SettingsDialog(QDialog):
         toggle_label = "Pause timer" if _running else "Start timer"
         self.toggle_button.setToolTip(toggle_label)
         self.toggle_button.setAccessibleName(toggle_label)
-        toggle_color = CONTROL_PLAYING_COLOR if _running else CONTROL_PAUSED_COLOR
+        toggle_color = _control_color()
         self.toggle_button.setStyleSheet(
             "QPushButton {"
             f"background-color:{toggle_color}; "
@@ -410,10 +537,18 @@ class SettingsDialog(QDialog):
         _config["timer_color"] = self.timer_color
         _config["settings_location"] = self.settings_location.currentData()
         _config["review_menu_position"] = self.menu_position.currentData()
-        _config.pop("review_menu_enabled", None)
+        _config["show_home_sessions"] = self.show_home_sessions.isChecked()
         mw.addonManager.writeConfig(__name__, _config)
         self.accept()
         _sync_settings_entry()
+        if getattr(mw, "state", None) == "deckBrowser":
+            deck_browser = getattr(mw, "deckBrowser", None)
+            if deck_browser is not None:
+                deck_browser.refresh()
+        elif getattr(mw, "state", None) == "overview":
+            overview = getattr(mw, "overview", None)
+            if overview is not None:
+                overview.refresh()
         _sync_open_menu()
         _update_bars()
         web = _review_web()
@@ -513,6 +648,8 @@ def _on_focus_did_change(new: QWidget | None, _old: QWidget | None) -> None:
 
 
 gui_hooks.webview_will_set_content.append(_inject_review_controls)
+gui_hooks.deck_browser_will_render_content.append(_append_home_sessions)
+gui_hooks.overview_will_render_content.append(_append_overview_sessions)
 gui_hooks.reviewer_did_answer_card.append(_on_answer)
 gui_hooks.reviewer_did_show_question.append(lambda _card: _update_bars())
 gui_hooks.reviewer_did_show_answer.append(lambda _card: _update_bars())

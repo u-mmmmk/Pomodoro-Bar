@@ -1,8 +1,9 @@
 {
-    "pomodoro_minutes": 25,
+    "pomodoro_minutes": 20,
     "reviews_per_full_bar": 100,
-    "timer_color": "#e76f51",
+    "timer_color": "#1e88e5",
     "height_px": 3,
     "settings_location": "toolbar",
-    "review_menu_position": "none"
+    "review_menu_position": "none",
+    "show_home_sessions": true
 }
