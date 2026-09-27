@@ -17,16 +17,22 @@ from aqt.qt import (
     QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
     QWidget,
+    Qt,
 )
 
 
 DEFAULTS = {
-    "pomodoro_minutes": 20,
+"pomodoro_minutes": 20,
     "reviews_per_full_bar": 100,
+    "rest_minutes": 0,
+    "auto_restart_after_rest": True,
+    "large_notifications": False,
+    "notify_review_goal": False,
     "timer_color": "#1e88e5",
     "height_px": 3,
     "settings_location": "toolbar",
@@ -45,6 +51,7 @@ CONTROL_PLAYING_COLOR = "#2e7d32"
 CONTROL_RESET_COLOR = "#444"
 CONTROL_PAUSED_COLOR = CONTROL_RESET_COLOR
 CONTROL_COMPLETE_COLOR = "#fb8c00"
+CONTROL_REST_COLOR = "#fb8c00"
 
 _saved_config = mw.addonManager.getConfig(__name__) or {}
 _config = {**DEFAULTS, **_saved_config}
@@ -68,8 +75,15 @@ _review_ratings: list[str] = []
 _running = False
 _session_active = False
 _completed = False
+_resting = False
+_rest_elapsed_before_start = 0.0
+_rest_started: float | None = None
+_review_goal_notified = False
 _resume_when_review_returns = False
+_review_active = False
 _tools_action: QAction | None = None
+_notice_label: QLabel | None = None
+_notice_timer = None
 
 
 def _timer_color() -> str:
@@ -79,6 +93,10 @@ def _timer_color() -> str:
 
 def _review_goal() -> int:
     return max(1, int(_config.get("reviews_per_full_bar", DEFAULTS["reviews_per_full_bar"])))
+
+
+def _rest_duration_seconds() -> int:
+    return max(0, int(_config.get("rest_minutes", DEFAULTS["rest_minutes"]))) * 60
 
 
 def _position_style(position: str) -> str:
@@ -93,8 +111,8 @@ def _position_style(position: str) -> str:
 
 def _menu_html() -> str:
     position = str(_config.get("review_menu_position", "none"))
-    toggle_icon = "⏸" if _running else "▶"
-    toggle_label = "Pause timer" if _running else "Start timer"
+    toggle_icon = _control_icon()
+    toggle_label = _control_label()
     toggle_color = _control_color()
     return f"""
 <div id="pomodoro-control-menu" style="position:fixed; z-index:2147483647; { _position_style(position) } display:flex; align-items:flex-start; gap:4px; pointer-events:auto;">
@@ -108,7 +126,7 @@ def _menu_html() -> str:
 
 
 def _bar_html() -> str:
-    height = max(1, min(12, int(_config.get("height_px", DEFAULTS["height_px"]))))
+    height = max(1, int(_config.get("height_px", DEFAULTS["height_px"])))
     return f"""
 <div id="pomodoro-review-bars" aria-hidden="true">
   <div class="pb-track"><div id="pb-timer" class="pb-fill"></div></div>
@@ -167,6 +185,12 @@ def _elapsed() -> float:
     if _running and _timer_started is not None:
         return _elapsed_before_start + time.monotonic() - _timer_started
     return _elapsed_before_start
+
+
+def _rest_elapsed() -> float:
+    if _resting and _running and _rest_started is not None:
+        return _rest_elapsed_before_start + time.monotonic() - _rest_started
+    return _rest_elapsed_before_start
 
 
 def _duration_seconds() -> int:
@@ -228,7 +252,19 @@ def _append_overview_sessions(overview: Any, content: Any) -> None:
 def _control_color() -> str:
     if _completed:
         return CONTROL_COMPLETE_COLOR
+    if _resting:
+        return CONTROL_REST_COLOR
     return CONTROL_PLAYING_COLOR if _running else CONTROL_PAUSED_COLOR
+
+
+def _control_icon() -> str:
+    return "⏸" if _running else "▶"
+
+
+def _control_label() -> str:
+    if _resting:
+        return "Pause rest" if _running else "Resume rest"
+    return "Pause timer" if _running else "Start timer"
 
 
 def _review_web() -> QWidget | None:
@@ -243,7 +279,11 @@ def _update_bars() -> None:
 
     duration = _duration_seconds()
     goal = _review_goal()
-    timer_pct = min(100, _elapsed() / duration * 100)
+    if _resting:
+        rest_duration = _rest_duration_seconds()
+        timer_pct = max(0, 100 - _rest_elapsed() / rest_duration * 100) if rest_duration else 0
+    else:
+        timer_pct = min(100, _elapsed() / duration * 100)
     review_pct = min(100, len(_review_ratings) / goal * 100)
     ratings_json = json.dumps(_review_ratings[:goal])
     colors_json = json.dumps(REVIEW_COLORS)
@@ -275,15 +315,16 @@ def _update_bars() -> None:
 def _refresh_menu_state(web: QWidget | None) -> None:
     if web is None:
         return
-    running = json.dumps(_running)
+    icon = json.dumps(_control_icon())
+    label = json.dumps(_control_label())
     color = json.dumps(_control_color())
     web.eval(f"""(() => {{
       const menu = document.getElementById('pomodoro-control-menu');
       if (!menu) return;
       const toggle = menu.querySelector('[data-pb-toggle]');
       if (toggle) {{
-        toggle.textContent = {running} ? '⏸' : '▶';
-        toggle.title = {running} ? 'Pause timer' : 'Start timer';
+        toggle.textContent = {icon};
+        toggle.title = {label};
         toggle.style.backgroundColor = {color};
         toggle.setAttribute('aria-label', toggle.title);
       }}
@@ -315,20 +356,30 @@ def _sync_open_menu() -> None:
 
 def _set_timer_running(running: bool) -> None:
     global _elapsed_before_start, _timer_started, _running, _session_active, _completed
+    global _rest_elapsed_before_start, _rest_started, _review_goal_notified
     if running:
         if _completed:
             _elapsed_before_start = 0.0
             _timer_started = None
             _review_ratings.clear()
             _completed = False
+            _review_goal_notified = False
         _session_active = True
     if running and not _running:
-        _timer_started = time.monotonic()
+        if _resting:
+            _rest_started = time.monotonic()
+        else:
+            _timer_started = time.monotonic()
         _running = True
     elif not running and _running:
-        if _timer_started is not None:
-            _elapsed_before_start += time.monotonic() - _timer_started
-        _timer_started = None
+        if _resting:
+            if _rest_started is not None:
+                _rest_elapsed_before_start += time.monotonic() - _rest_started
+            _rest_started = None
+        else:
+            if _timer_started is not None:
+                _elapsed_before_start += time.monotonic() - _timer_started
+            _timer_started = None
         _running = False
     _ensure_ticker()
     _update_bars()
@@ -343,10 +394,15 @@ def _toggle_timer() -> None:
 
 def _reset_timer() -> None:
     global _elapsed_before_start, _timer_started, _session_active, _resume_when_review_returns, _completed
+    global _resting, _rest_elapsed_before_start, _rest_started, _review_goal_notified
     _elapsed_before_start = 0.0
     _timer_started = time.monotonic() if _running else None
     _session_active = _running
     _completed = False
+    _resting = False
+    _rest_elapsed_before_start = 0.0
+    _rest_started = None
+    _review_goal_notified = False
     _resume_when_review_returns = False
     _review_ratings.clear()
     _update_bars()
@@ -369,8 +425,16 @@ def _answer_rating(reviewer, card, ease: int) -> str:
 
 
 def _on_answer(reviewer, card, ease: int) -> None:
+    global _review_goal_notified
     if _session_active:
         _review_ratings.append(_answer_rating(reviewer, card, ease))
+        if (
+            _config.get("notify_review_goal", DEFAULTS["notify_review_goal"])
+            and not _review_goal_notified
+            and len(_review_ratings) >= _review_goal()
+        ):
+            _review_goal_notified = True
+            _show_notice("Review goal reached!")
     _update_bars()
 
 
@@ -390,18 +454,104 @@ def _ensure_ticker() -> None:
 
 
 def _show_completion_notice() -> None:
-    from aqt.utils import tooltip
+    _show_notice("Pomodoro complete!")
 
-    tooltip("Pomodoro complete!", period=3000)
+
+def _show_notice(message: str) -> None:
+    global _notice_label, _notice_timer
+    if not _config.get("large_notifications", DEFAULTS["large_notifications"]):
+        from aqt.utils import tooltip
+
+        tooltip(message, period=3000)
+        return
+
+    from aqt.qt import QTimer
+
+    if _notice_label is None:
+        _notice_label = _DismissibleNotice(mw)
+        _notice_label.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        _notice_label.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        _notice_label.setStyleSheet(
+            "QLabel { background:#202124; color:white; border:1px solid #666; "
+            "border-radius:8px; padding:14px 22px; font-size:20px; font-weight:600; }"
+        )
+        _notice_timer = QTimer(_notice_label)
+        _notice_timer.setSingleShot(True)
+        _notice_timer.timeout.connect(_notice_label.hide)
+    _notice_label.setText(message)
+    _notice_label.adjustSize()
+    review_web = _review_web()
+    if review_web is not None and getattr(mw, "state", None) == "review":
+        center = review_web.mapToGlobal(review_web.rect().center())
+    else:
+        center = mw.frameGeometry().center()
+    _notice_label.move(
+        center.x() - _notice_label.width() // 2,
+        center.y() - _notice_label.height() // 2,
+    )
+    _notice_label.show()
+    _notice_label.raise_()
+    _notice_timer.start(3000)
+
+
+def _start_fresh_focus(*, running: bool) -> None:
+    global _elapsed_before_start, _timer_started, _session_active, _completed
+    global _resting, _rest_elapsed_before_start, _rest_started, _review_goal_notified
+    _elapsed_before_start = 0.0
+    _timer_started = None
+    _resting = False
+    _rest_elapsed_before_start = 0.0
+    _rest_started = None
+    _completed = False
+    _review_goal_notified = False
+    _review_ratings.clear()
+    _session_active = running
+    if running:
+        _set_timer_running(True)
+    else:
+        _ensure_ticker()
+        _update_bars()
+        _refresh_menu_state(_review_web())
 
 
 def _on_tick() -> None:
-    global _completed
-    if _running and _elapsed() >= _duration_seconds():
-        _set_timer_running(False)
-        _completed = True
-        _refresh_menu_state(_review_web())
+    global _completed, _resting, _running, _rest_elapsed_before_start, _rest_started
+    global _resume_when_review_returns
+    if _resting and _running and _rest_elapsed() >= _rest_duration_seconds():
+        _running = False
+        _resting = False
+        _rest_elapsed_before_start = 0.0
+        _rest_started = None
+        auto_restart = bool(
+            _config.get("auto_restart_after_rest", DEFAULTS["auto_restart_after_rest"])
+        )
+        restart_in_review = (
+            auto_restart
+            and _review_active
+            and getattr(mw, "state", None) == "review"
+        )
+        _resume_when_review_returns = auto_restart and not restart_in_review
+        _start_fresh_focus(running=restart_in_review)
         _refresh_open_settings_dialogs()
+        _show_notice("Rest complete!")
+    elif not _resting and _running and _elapsed() >= _duration_seconds():
+        _set_timer_running(False)
+        if _rest_duration_seconds() > 0:
+            _resting = True
+            _rest_elapsed_before_start = 0.0
+            _rest_started = time.monotonic()
+            _running = True
+            _ensure_ticker()
+            _refresh_menu_state(_review_web())
+            _refresh_open_settings_dialogs()
+        else:
+            _completed = True
+            _refresh_menu_state(_review_web())
+            _refresh_open_settings_dialogs()
         _show_completion_notice()
     _update_bars()
 
@@ -409,6 +559,12 @@ def _on_tick() -> None:
 def _refresh_open_settings_dialogs() -> None:
     for dialog in mw.findChildren(SettingsDialog):
         dialog._refresh_status()
+
+
+class _DismissibleNotice(QLabel):
+    def mousePressEvent(self, event) -> None:
+        self.hide()
+        event.accept()
 
 
 class SettingsDialog(QDialog):
@@ -419,14 +575,29 @@ class SettingsDialog(QDialog):
         form = QFormLayout()
 
         self.minutes = QSpinBox()
-        self.minutes.setRange(1, 240)
+        self.minutes.setRange(1, 2_147_483_647)
         self.minutes.setValue(int(_config["pomodoro_minutes"]))
         self.review_goal = QSpinBox()
-        self.review_goal.setRange(1, 1000)
+        self.review_goal.setRange(1, 2_147_483_647)
         self.review_goal.setValue(int(_config["reviews_per_full_bar"]))
+        self.rest_minutes = QSpinBox()
+        self.rest_minutes.setRange(0, 2_147_483_647)
+        self.rest_minutes.setValue(int(_config["rest_minutes"]))
+        self.auto_restart_after_rest = QCheckBox(
+            "Pomodoro timer automatically restarts after rest"
+        )
+        self.auto_restart_after_rest.setChecked(
+            bool(_config["auto_restart_after_rest"])
+        )
         self.height = QSpinBox()
-        self.height.setRange(1, 12)
+        self.height.setRange(1, 2_147_483_647)
         self.height.setValue(int(_config["height_px"]))
+        self.large_notifications = QCheckBox("Use larger notifications")
+        self.large_notifications.setChecked(bool(_config["large_notifications"]))
+        self.notify_review_goal = QCheckBox(
+            "Notify when the review goal is reached"
+        )
+        self.notify_review_goal.setChecked(bool(_config["notify_review_goal"]))
         self.show_home_sessions = QCheckBox(
             "Show number of Pomodoro sessions to complete cards"
         )
@@ -454,11 +625,15 @@ class SettingsDialog(QDialog):
         self.menu_position.setCurrentIndex(max(0, self.menu_position.findData(_config.get("review_menu_position", "none"))))
 
         form.addRow("Pomodoro length (minutes)", self.minutes)
-        form.addRow("Reviews for full counter bar", self.review_goal)
+        form.addRow("Reviews goal for pomodoro session", self.review_goal)
+        form.addRow("Rest length (minutes)", self.rest_minutes)
         form.addRow("Bar thickness (pixels)", self.height)
         form.addRow("Timer bar color", self.color_button)
         form.addRow("Settings entry location", self.settings_location)
         form.addRow("Timer controls location", self.menu_position)
+        form.addRow(self.auto_restart_after_rest)
+        form.addRow(self.large_notifications)
+        form.addRow(self.notify_review_goal)
         form.addRow(self.show_home_sessions)
         outer.addLayout(form)
 
@@ -500,8 +675,8 @@ class SettingsDialog(QDialog):
             self._refresh_color_button()
 
     def _refresh_status(self) -> None:
-        self.toggle_button.setText("⏸" if _running else "▶")
-        toggle_label = "Pause timer" if _running else "Start timer"
+        self.toggle_button.setText(_control_icon())
+        toggle_label = _control_label()
         self.toggle_button.setToolTip(toggle_label)
         self.toggle_button.setAccessibleName(toggle_label)
         toggle_color = _control_color()
@@ -533,7 +708,11 @@ class SettingsDialog(QDialog):
     def _save(self) -> None:
         _config["pomodoro_minutes"] = self.minutes.value()
         _config["reviews_per_full_bar"] = self.review_goal.value()
+        _config["rest_minutes"] = self.rest_minutes.value()
+        _config["auto_restart_after_rest"] = self.auto_restart_after_rest.isChecked()
         _config["height_px"] = self.height.value()
+        _config["large_notifications"] = self.large_notifications.isChecked()
+        _config["notify_review_goal"] = self.notify_review_goal.isChecked()
         _config["timer_color"] = self.timer_color
         _config["settings_location"] = self.settings_location.currentData()
         _config["review_menu_position"] = self.menu_position.currentData()
@@ -553,7 +732,7 @@ class SettingsDialog(QDialog):
         _update_bars()
         web = _review_web()
         if web is not None:
-            height = max(1, min(12, self.height.value()))
+            height = max(1, self.height.value())
             web.eval(f"""(() => {{
               const timer = document.getElementById('pb-timer');
               if (timer) timer.style.backgroundColor = {json.dumps(_timer_color())};
@@ -611,31 +790,38 @@ def _handle_menu_message(handled: tuple[bool, Any], message: str, _context: Any)
 
 def _pause_for_review_exit() -> None:
     global _resume_when_review_returns
+    if _resting:
+        return
     if _running:
         _resume_when_review_returns = True
     _set_timer_running(False)
 
 
 def _on_state_will_change(new_state: str, old_state: str) -> None:
+    global _review_active
     if old_state == "review" and new_state != "review":
+        _review_active = False
         _pause_for_review_exit()
 
 
 def _on_state_did_change(new_state: str, old_state: str) -> None:
-    global _resume_when_review_returns
-    if new_state == "review" and old_state != "review" and _resume_when_review_returns:
+    global _resume_when_review_returns, _review_active
+    if new_state == "review":
+        _review_active = True
+    if new_state == "review" and old_state != "review" and _resume_when_review_returns and not _resting:
         _resume_when_review_returns = False
         _set_timer_running(True)
 
 
 def _on_focus_did_change(new: QWidget | None, _old: QWidget | None) -> None:
-    global _resume_when_review_returns
+    global _resume_when_review_returns, _review_active
     if getattr(mw, "state", None) != "review":
         return
 
     window = new.window() if new is not None else None
     if window is mw:
-        if _resume_when_review_returns:
+        _review_active = True
+        if _resume_when_review_returns and not _resting:
             _resume_when_review_returns = False
             _set_timer_running(True)
     else:
@@ -644,6 +830,7 @@ def _on_focus_did_change(new: QWidget | None, _old: QWidget | None) -> None:
             if isinstance(current, SettingsDialog):
                 return
             current = current.parentWidget()
+        _review_active = False
         _pause_for_review_exit()
 
 

@@ -1,6 +1,10 @@
 {
     "pomodoro_minutes": 20,
     "reviews_per_full_bar": 100,
+    "rest_minutes": 0,
+    "auto_restart_after_rest": true,
+    "large_notifications": false,
+    "notify_review_goal": false,
     "timer_color": "#1e88e5",
     "height_px": 3,
     "settings_location": "toolbar",

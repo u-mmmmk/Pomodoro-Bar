@@ -20,14 +20,26 @@ answers as you work through cards. This add on was vibe coded with GPT-6 Luna
   uses that deck's available New, Learn, and Review counts, including its subdecks.
 - Compact play/pause and reset controls in the settings dialog, with optional
   controls in any corner of the review screen.
-- The timer automatically pauses at its limit and shows a brief completion
-  notice. The play button turns orange until you press Play or Reset; pressing
-  Play after completion starts a fresh countdown and clears the review bar.
+- At the focus limit, the add-on shows a brief completion notice. With rest
+  enabled, the timer bar then shrinks through the rest period; without rest,
+  the play button turns orange until you press Play or Reset. Pressing Play
+  after completion starts a fresh countdown and clears the review bar.
+- An optional rest period starts with a full timer bar and counts down to zero.
+  Rest continues while you leave review. By default, when it ends, a new
+  Pomodoro starts automatically if review is active; otherwise, it starts when
+  you return. You can turn off automatic restart to leave the new Pomodoro
+  ready at zero until you press Play. Setting rest to zero keeps the standard
+  completed state.
+- Optional larger, non-blocking notices apply to Pomodoro completion, rest
+  completion, and the review-goal alert. The review-goal alert can be enabled
+  separately and appears once when the count first reaches or passes the goal
+  in each Pomodoro.
 - Automatic pause when you leave or switch away from review. If the timer was
   running, it resumes when you return.
-- Settings for timer duration, review goal, timer bar color, bar thickness, and
+- Settings for timer duration, review goal, rest duration, timer bar color, bar thickness, and
   whether the settings shortcut appears in the top toolbar or Tools menu, plus
-  an option to show or hide the session count.
+  options for notifications and the session count. Timer duration, review goal,
+  and bar thickness have no add-on-defined upper limit.
 
 ## Use
 
@@ -55,6 +67,10 @@ Pomodoro Bar requires Anki 23.10 or newer.
 
 - Timer: 20 minutes
 - Review goal: 100 cards
+- Rest: 0 minutes (disabled)
+- Automatically restart after rest: on
+- Larger notifications: off
+- Review-goal notification: off
 - Session count: shown
 - Timer bar color: `#1e88e5`
 - Bar thickness: 3 pixels
